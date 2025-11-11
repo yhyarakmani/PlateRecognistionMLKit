@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "PlateRecognistionMLKit"
+rootProject.name = "PlateRecognistionMLKitSDK"
 include(":app")
 include(":plate-scanner")
