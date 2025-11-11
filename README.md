@@ -24,6 +24,32 @@ This library is designed for **Jetpack Compose apps**, providing a simple compos
 
 ---
 
+## Installation
+
+### Step 1. Add Jitpack to your settings.gradle.kts
+
+Add it in your settings.gradle.kts at the end of repositories:
+
+	kotlin
+    dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+            mavenCentral()
+            maven { url = uri("https://jitpack.io") }
+        }
+    }
+
+### Step 2. Add the dependency
+
+Add the dependency to your module's build.gradle.kts file:
+
+	kotlin
+	dependencies {
+	        implementation("com.github.yhyarakmani:PlateRecognistionMLKit:1.0.0")
+	}
+
+---
+
 ## Usage Example
 
 ```kotlin
