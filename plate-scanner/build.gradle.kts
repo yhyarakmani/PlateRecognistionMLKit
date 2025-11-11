@@ -91,7 +91,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.cashin"
                 artifactId = "plate-scanner"
-                version = "1.0.0"
+                version = "1.0.1"
             }
         }
         repositories {

@@ -93,12 +93,22 @@ internal fun CameraScreen(
                 val right = box.right * scale + horizontalOffset
                 val bottom = box.bottom * scale + verticalOffset
 
+                // Compute new doubled size
+                val width = (right - left)
+                val height = (bottom - top)
+                val newWidth = width * 2
+                val newHeight = height * 2
+
+                // Shift top-left to keep the rect centered after doubling
+                val newLeft = left - (newWidth - width) / 2f
+                val newTop = top - (newHeight - height) / 2f
+
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     drawRoundRect(
                         cornerRadius = androidx.compose.ui.geometry.CornerRadius(16.dp.toPx()),
                         color = Color.Green,
-                        topLeft = Offset(left, top),
-                        size = Size((right - left) * 2, (bottom - top) * 2),
+                        topLeft = Offset(newLeft, newTop),
+                        size = Size(newWidth, newHeight),
                         style = Stroke(width = 3.dp.toPx())
                     )
                 }
