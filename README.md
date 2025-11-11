@@ -45,7 +45,7 @@ Add the dependency to your module's build.gradle.kts file:
 
 	kotlin
 	dependencies {
-	        implementation("com.github.yhyarakmani:PlateRecognistionMLKit:1.0.3")
+	        implementation("com.github.yhyarakmani:PlateRecognistionMLKit:1.0.5")
 	}
 
 ---
