@@ -72,7 +72,8 @@ dependencies {
 
     // MLKit + ONNX
     api(libs.text.recognition)
-    api(libs.onnxruntime.android)
+    api(libs.tflite)
+    api(libs.tfliteSupport)
 
     // --- Testing ---
     testImplementation(libs.junit)

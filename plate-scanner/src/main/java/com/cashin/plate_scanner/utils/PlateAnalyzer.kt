@@ -1,8 +1,5 @@
 package com.cashin.plate_scanner.utils
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
@@ -23,7 +20,13 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -32,6 +35,13 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 
+/**
+ * Converts the YOLO ONNX model analysis pipeline to use a TFLite Interpreter.
+ * Assumes the TFLite model:
+ * 1. Is named 'model.tflite' and placed in the 'assets' folder.
+ * 2. Has a float32 input in NCHW (1, 3, 640, 640) format.
+ * 3. Has a float32 output in the expected YOLOv8/v11 format (e.g., [1, 5, 8400]).
+ */
 internal class PlateAnalyzer(
     context: Context,
     private val onResult: (PipelineResult?) -> Unit
@@ -40,8 +50,12 @@ internal class PlateAnalyzer(
     companion object {
         private const val MODEL_WIDTH = 640
         private const val MODEL_HEIGHT = 640
-        private const val MODEL_FILE = "license-plate-finetune-v1s.onnx"
+        private const val MODEL_FILE = "license-plate-finetune-v1s.tflite" // TFLite model file name
         private const val ANALYSIS_INTERVAL = 500L // 2 frames/sec
+
+        // Constants for TFLite input buffer size (float32, 3 channels)
+        private const val NUM_CHANNELS = 3
+        private const val FLOAT_SIZE = 4 // 4 bytes per float
     }
 
     // State management
@@ -49,13 +63,15 @@ internal class PlateAnalyzer(
     private val state = AtomicReference(AnalyzerState.INITIALIZING)
 
     // Thread synchronization
-    private val onnxLock = ReentrantLock()
+    private val tfliteLock = ReentrantLock()
     private val processingSemaphore = Semaphore(1) // Only one frame at a time
 
-    // ONNX Resources (protected by onnxLock)
-    private var ortEnvironment: OrtEnvironment? = null
-    private var ortSession: OrtSession? = null
-    private var inputName: String? = null
+    // TFLite Resources (protected by tfliteLock)
+    private var tfliteInterpreter: Interpreter? = null
+
+    // Pre-allocated for efficient inference (Input and Output)
+    private lateinit var inputBuffer: ByteBuffer
+    private lateinit var outputBuffer: FloatBuffer // Output is a FloatBuffer
 
     // OCR
     private val ocr = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -64,34 +80,55 @@ internal class PlateAnalyzer(
     private var lastAnalyzedTimestamp = 0L
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // Helper to map the model from assets to MappedByteBuffer
+    private fun loadModelFile(context: Context, modelFileName: String): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd(modelFileName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = fileDescriptor.startOffset
+        val declaredLength = fileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
+
     init {
         // Load model asynchronously
         scope.launch(Dispatchers.IO) {
             try {
-                val env = OrtEnvironment.getEnvironment()
-                val modelBytes = context.assets.open(MODEL_FILE).readBytes()
-                val session = env.createSession(modelBytes)
-                val input = session.inputNames.first()
+                // 1. Load model file
+                val modelFile = loadModelFile(context, MODEL_FILE)
 
-                onnxLock.lock()
+                // 2. Initialize TFLite Interpreter
+                // NOTE: Add options here if you need GPU/NNAPI delegation
+                val interpreter = Interpreter(modelFile, Interpreter.Options())
+
+                // 3. Pre-allocate buffers based on model requirements
+                // TFLite requires a direct ByteBuffer for runForMultipleInputsOutputs
+                inputBuffer = ByteBuffer.allocateDirect(
+                    1 * MODEL_WIDTH * MODEL_HEIGHT * NUM_CHANNELS * FLOAT_SIZE
+                ).order(ByteOrder.nativeOrder())
+
+                // Determine output size. TFLite's output shape must match the model's output.
+                // Assuming [1, 5, 8400] output for YOLOv11/v8 detection.
+                val outputShape = interpreter.getOutputTensor(0).shape()
+                val outputSize = outputShape.fold(1) { acc, i -> acc * i }
+                outputBuffer = FloatBuffer.allocate(outputSize)
+
+
+                tfliteLock.lock()
                 try {
                     if (state.get() == AnalyzerState.CLOSED) {
-                        // Clean up if closed during initialization
-                        session.close()
-                        env.close()
+                        interpreter.close()
                         return@launch
                     }
 
-                    ortEnvironment = env
-                    ortSession = session
-                    inputName = input
+                    tfliteInterpreter = interpreter
                     state.set(AnalyzerState.READY)
-                    Log.d("PlateAnalyzer", "ONNX Model Loaded Successfully. Input: $input")
+                    Log.d("PlateAnalyzer", "TFLite Model Loaded Successfully. Output shape: ${outputShape.joinToString()}")
                 } finally {
-                    onnxLock.unlock()
+                    tfliteLock.unlock()
                 }
             } catch (e: Exception) {
-                Log.e("PlateAnalyzer", "Failed to load ONNX model", e)
+                Log.e("PlateAnalyzer", "Failed to load TFLite model", e)
                 state.set(AnalyzerState.CLOSED)
             }
         }
@@ -99,62 +136,58 @@ internal class PlateAnalyzer(
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
-        // Immediately reject frames if not ready or closing/closed
+        // State and interval checks
         if (state.get() != AnalyzerState.READY) {
             imageProxy.close()
             return
         }
-
-        // Check analysis interval
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastAnalyzedTimestamp < ANALYSIS_INTERVAL) {
             imageProxy.close()
             return
         }
-
-        // Try to acquire semaphore to limit concurrent processing
         if (!processingSemaphore.tryAcquire()) {
             imageProxy.close()
             return
         }
-
         lastAnalyzedTimestamp = currentTime
 
         scope.launch(Dispatchers.IO) {
             var shouldCloseProxy = true
             try {
-                // Double-check state after acquiring semaphore
-                if (state.get() != AnalyzerState.READY) {
-                    return@launch
-                }
+                if (state.get() != AnalyzerState.READY) return@launch
 
-                // Convert to bitmap
                 val bitmap = imageProxy.toBitmapY() ?: return@launch
 
-                // Preprocess
-                val (inputBuffer, scaleFactor, padX) = preprocess(bitmap)
+                // Preprocess: We MUST convert the FloatBuffer from preprocess()
+                // into the required ByteBuffer format for TFLite.
+                val (floatBuffer, scaleFactor, padX) = preprocess(bitmap)
 
-                // Run detection with lock protection
-                onnxLock.lock()
+                // Copy FloatBuffer content (NCHW) to the direct ByteBuffer
+                // The FloatBuffer's capacity matches the ByteBuffer's capacity, so this is safe.
+                inputBuffer.rewind()
+                floatBuffer.rewind()
+                inputBuffer.asFloatBuffer().put(floatBuffer)
+
+                // Run detection
+                tfliteLock.lock()
                 try {
-                    if (state.get() != AnalyzerState.READY) {
-                        return@launch
-                    }
+                    if (state.get() != AnalyzerState.READY) return@launch
 
-                    val outputBuffer = runYoloDetectionWithLock(inputBuffer)
+                    val outputFloatBuffer = runYoloDetectionWithLock()
+
                     val bestBox = postprocess(
-                        outputBuffer,
+                        outputFloatBuffer,
                         scaleFactor,
                         padX,
                         bitmap.width,
                         bitmap.height
                     ) ?: return@launch
 
-                    // Release lock before OCR (which can take time)
-                    onnxLock.unlock()
+                    tfliteLock.unlock()
                     shouldCloseProxy = false
 
-                    // Crop and run OCR
+                    // Crop and run OCR (same logic)
                     val croppedBitmap = Bitmap.createBitmap(
                         bitmap,
                         bestBox.left,
@@ -182,7 +215,7 @@ internal class PlateAnalyzer(
                     }
                 } finally {
                     if (shouldCloseProxy) {
-                        onnxLock.unlock()
+                        tfliteLock.unlock()
                     }
                 }
             } catch (e: Exception) {
@@ -196,21 +229,24 @@ internal class PlateAnalyzer(
         }
     }
 
-    private fun runYoloDetectionWithLock(inputBuffer: FloatBuffer): FloatBuffer {
-        // This method should ONLY be called while holding onnxLock
-        val environment = ortEnvironment ?: throw IllegalStateException("ONNX Runtime not initialized")
-        val session = ortSession ?: throw IllegalStateException("ONNX Session not initialized")
-        val input = inputName ?: throw IllegalStateException("Input name not available")
+    /**
+     * TFLite specific detection method.
+     * This method should ONLY be called while holding tfliteLock.
+     * Assumes the global 'inputBuffer' has been filled by the caller.
+     */
+    private fun runYoloDetectionWithLock(): FloatBuffer {
+        val interpreter = tfliteInterpreter ?: throw IllegalStateException("TFLite Interpreter not initialized")
 
-        val shape = longArrayOf(1, 3, MODEL_HEIGHT.toLong(), MODEL_WIDTH.toLong())
-        val tensor = OnnxTensor.createTensor(environment, inputBuffer, shape)
+        // Reset output buffer for fresh results
+        outputBuffer.rewind()
 
-        try {
-            val results = session.run(mapOf(input to tensor))
-            return (results.first().value as OnnxTensor).floatBuffer
-        } finally {
-            tensor.close()
-        }
+        // TFLite's run method takes an object array for input and a map for output
+        val outputMap = mapOf(0 to outputBuffer)
+
+        // Run the model: [inputs: Array<Any>, outputs: Map<Int, Any>]
+        interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
+
+        return outputBuffer
     }
 
     private suspend fun <T> com.google.android.gms.tasks.Task<T>.await(): T {
@@ -227,21 +263,17 @@ internal class PlateAnalyzer(
     }
 
     fun close() {
-        // Fast path if already closed
         if (state.get() == AnalyzerState.CLOSED) return
 
-        // Transition to CLOSING state
         if (!state.compareAndSet(AnalyzerState.READY, AnalyzerState.CLOSING) &&
             !state.compareAndSet(AnalyzerState.INITIALIZING, AnalyzerState.CLOSING)) {
             return
         }
 
-        // Cancel all ongoing work
         scope.coroutineContext.cancelChildren()
 
         // Wait for any in-flight analysis to finish
         try {
-            // Try to acquire semaphore - this will wait until current processing completes
             if (processingSemaphore.tryAcquire(2, TimeUnit.SECONDS)) {
                 processingSemaphore.release()
             }
@@ -249,22 +281,20 @@ internal class PlateAnalyzer(
             Log.w("PlateAnalyzer", "Timeout waiting for analysis to complete", e)
         }
 
-        // Close ONNX resources with lock protection
-        onnxLock.lock()
+        // Close TFLite resources
+        tfliteLock.lock()
         try {
             runCatching {
-                ortSession?.close()
-                ortEnvironment?.close()
+                tfliteInterpreter?.close()
             }.onFailure { e ->
-                Log.e("PlateAnalyzer", "Error closing ONNX resources", e)
+                Log.e("PlateAnalyzer", "Error closing TFLite resources", e)
             }
 
-            ortSession = null
-            ortEnvironment = null
+            tfliteInterpreter = null
             state.set(AnalyzerState.CLOSED)
             Log.d("PlateAnalyzer", "Analyzer closed successfully")
         } finally {
-            onnxLock.unlock()
+            tfliteLock.unlock()
         }
     }
 }
