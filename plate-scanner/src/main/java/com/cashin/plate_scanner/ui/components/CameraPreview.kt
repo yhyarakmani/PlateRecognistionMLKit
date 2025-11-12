@@ -25,19 +25,19 @@ internal fun CameraPreview(
 ) {
     val context = LocalContext.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
-
+    val analyzer = remember {
+        PlateAnalyzer(context) { result ->
+            onResult(result)
+        }
+    }
     AndroidView(
-        modifier = Modifier
-            .fillMaxSize(),
+        modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
             val previewView = PreviewView(ctx)
             val cameraProvider = cameraProviderFuture.get()
 
             val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-            val analyzer = PlateAnalyzer(context) { result ->
-                onResult(result)
+                it.surfaceProvider = previewView.surfaceProvider
             }
 
             val imageAnalyzer = ImageAnalysis.Builder()
@@ -60,6 +60,10 @@ internal fun CameraPreview(
             }
 
             previewView
+        },
+        onRelease = { previewView ->
+            // Clean up the analyzer when the composable is disposed
+            analyzer.close()
         }
     )
 }
