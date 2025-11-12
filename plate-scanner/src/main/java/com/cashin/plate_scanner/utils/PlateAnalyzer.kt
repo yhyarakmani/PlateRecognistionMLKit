@@ -64,7 +64,7 @@ internal class PlateAnalyzer(
 
     // Thread synchronization
     private val tfliteLock = ReentrantLock()
-    private val processingSemaphore = Semaphore(1) // Only one frame at a time
+    private val processingSemaphore = Semaphore(4) // Only one frame at a time
 
     // TFLite Resources (protected by tfliteLock)
     private var tfliteInterpreter: Interpreter? = null
@@ -138,38 +138,58 @@ internal class PlateAnalyzer(
     override fun analyze(imageProxy: ImageProxy) {
         // State and interval checks
         if (state.get() != AnalyzerState.READY) {
-            imageProxy.close()
+            imageProxy.close() // Close if not ready
             return
         }
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastAnalyzedTimestamp < ANALYSIS_INTERVAL) {
-            imageProxy.close()
+            imageProxy.close() // Close if interval too short
             return
         }
+
+        // Try to acquire semaphore to limit concurrent processing
         if (!processingSemaphore.tryAcquire()) {
-            imageProxy.close()
+            imageProxy.close() // Close if another frame is still processing
             return
         }
         lastAnalyzedTimestamp = currentTime
 
         scope.launch(Dispatchers.IO) {
-            var shouldCloseProxy = true
+            // NOTE: We don't need 'shouldCloseProxy' flag anymore because we close it early.
+
+            // 1. Convert to bitmap and close proxy immediately
+            val bitmap = try {
+                val tempBitmap = imageProxy.toBitmapY()
+                imageProxy.close() // IMMEDIATELY RELEASE THE IMAGE PROXY
+                tempBitmap?.config?.let {tempConfig->
+                    tempBitmap.copy(tempConfig, true)
+                }
+            } catch (e: Exception) {
+                // Log and return if image acquisition or copy fails
+                Log.e("PlateAnalyzer", "Error converting ImageProxy to Bitmap.", e)
+                processingSemaphore.release()
+                return@launch
+            }
+
+            if (bitmap == null) {
+                processingSemaphore.release()
+                return@launch
+            }
+
             try {
-                if (state.get() != AnalyzerState.READY) return@launch
+                if (state.get() != AnalyzerState.READY) {
+                    return@launch
+                }
 
-                val bitmap = imageProxy.toBitmapY() ?: return@launch
-
-                // Preprocess: We MUST convert the FloatBuffer from preprocess()
-                // into the required ByteBuffer format for TFLite.
+                // Preprocess
                 val (floatBuffer, scaleFactor, padX) = preprocess(bitmap)
 
                 // Copy FloatBuffer content (NCHW) to the direct ByteBuffer
-                // The FloatBuffer's capacity matches the ByteBuffer's capacity, so this is safe.
                 inputBuffer.rewind()
                 floatBuffer.rewind()
                 inputBuffer.asFloatBuffer().put(floatBuffer)
 
-                // Run detection
+                // Run detection with lock protection
                 tfliteLock.lock()
                 try {
                     if (state.get() != AnalyzerState.READY) return@launch
@@ -184,8 +204,8 @@ internal class PlateAnalyzer(
                         bitmap.height
                     ) ?: return@launch
 
+                    // Release lock before OCR (which can take time)
                     tfliteLock.unlock()
-                    shouldCloseProxy = false
 
                     // Crop and run OCR (same logic)
                     val croppedBitmap = Bitmap.createBitmap(
@@ -214,7 +234,8 @@ internal class PlateAnalyzer(
                         }
                     }
                 } finally {
-                    if (shouldCloseProxy) {
+                    // Lock release: Only release if lock was acquired successfully and not already released before OCR
+                    if (tfliteLock.isHeldByCurrentThread) {
                         tfliteLock.unlock()
                     }
                 }
@@ -223,12 +244,11 @@ internal class PlateAnalyzer(
                     Log.e("PlateAnalyzer", "Analysis failed", e)
                 }
             } finally {
-                imageProxy.close()
+                // Only release the semaphore here. ImageProxy is already closed.
                 processingSemaphore.release()
             }
         }
     }
-
     /**
      * TFLite specific detection method.
      * This method should ONLY be called while holding tfliteLock.
