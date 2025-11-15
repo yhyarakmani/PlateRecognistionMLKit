@@ -50,7 +50,7 @@ internal class PlateAnalyzer(
     companion object {
         private const val MODEL_WIDTH = 640
         private const val MODEL_HEIGHT = 640
-        private const val MODEL_FILE = "license-plate-finetune-v1s.tflite" // TFLite model file name
+        private const val MODEL_FILE = "license-plate-finetune-v1n.tflite" // TFLite model file name
         private const val ANALYSIS_INTERVAL = 500L // 2 frames/sec
 
         // Constants for TFLite input buffer size (float32, 3 channels)
@@ -64,7 +64,7 @@ internal class PlateAnalyzer(
 
     // Thread synchronization
     private val tfliteLock = ReentrantLock()
-    private val processingSemaphore = Semaphore(4) // Only one frame at a time
+    private val processingSemaphore = Semaphore(1) // Only one frame at a time
 
     // TFLite Resources (protected by tfliteLock)
     private var tfliteInterpreter: Interpreter? = null
